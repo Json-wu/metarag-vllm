@@ -1,0 +1,50 @@
+version: '3.8'
+
+services:
+  rag-m4:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rag-m4-app
+    ports:
+      - "8501:8501"
+    volumes:
+      # 持久化向量数据库
+      - ./chroma_db:/app/chroma_db
+      # 可选：挂载配置文件
+      - ./rag_m4.py:/app/rag_m4.py
+    environment:
+      - STREAMLIT_SERVER_PORT=8501
+      - STREAMLIT_SERVER_ADDRESS=0.0.0.0
+      - STREAMLIT_SERVER_HEADLESS=true
+      - OLLAMA_HOST=http://ollama:11434
+    restart: unless-stopped
+    networks:
+      - rag-network
+    depends_on:
+      - ollama
+
+  # 可选：如果需要本地 Ollama 服务
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama-service
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    restart: unless-stopped
+    networks:
+      - rag-network
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+networks:
+  rag-network:
+    driver: bridge
+
+volumes:
+  ollama-data:

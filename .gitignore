@@ -3,6 +3,9 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+# chroma
+chroma_db/
+
 # C extensions
 *.so
 
