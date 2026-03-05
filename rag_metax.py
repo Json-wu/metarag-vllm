@@ -28,7 +28,7 @@ from langchain_core.runnables.history import RunnableWithMessageHistory
 CONFIG = {
     # LLM 配置（OpenAI 兼容接口，对接 vLLM/Ollama）
     "llm_base_url": "http://localhost:8000/v1",  # vLLM 服务地址
-    "llm_model": "qwen2.5-7b", #"Qwen2.5-72B-Instruct",         # 模型名称
+    "llm_model": "qwen2.5-72b", #"Qwen2.5-72B-Instruct",         # 模型名称
     "llm_api_key": "EMPTY",                       # 本地部署无需真实 key
     "llm_temperature": 0.3,
     "llm_max_tokens": 2048,
