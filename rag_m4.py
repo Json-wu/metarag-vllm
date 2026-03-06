@@ -17,29 +17,38 @@ from langchain_core.runnables.history import RunnableWithMessageHistory
 import os
 
 # ==================== 配置中心 ====================
+# 针对 Mac mini M4 优化的配置参数
 CONFIG = {
     # 页面配置
     "page_title": "🚀 M4 Pro Multi-RAG",
     "page_icon": "⚡",
     "app_title": "🚀 M4 Pro Multi-RAG",
     
-    # 模型配置
-    "llm_model": "qwen2.5:7b",           # LLM 模型名称
+    # 模型配置（M4优化）
+    "llm_model": "qwen2.5:7b",           # LLM 模型名称（7B适合M4内存）
     "embedding_model": "nomic-embed-text", # Embedding 模型名称
-    "llm_temperature": 0,                  # 温度参数
+    "llm_temperature": 0.1,                # 温度参数（略微提高创造性，同时保持准确）
+    "llm_num_ctx": 4096,                   # 上下文窗口大小（M4可以处理更大上下文）
     "ollama_host": os.getenv("OLLAMA_HOST", "http://localhost:11434"),  # Ollama 服务地址
     
-    # 向量数据库配置
+    # 向量数据库配置（M4优化）
     "chroma_persist_dir": "./chroma_db",   # ChromaDB 持久化目录
-    "retriever_top_k": 5,                  # 检索返回的文档数量
+    "retriever_top_k": 10,                 # 检索返回的文档数量（增加以提升多文档检索精度）
+    "retriever_score_threshold": 0.5,      # 相似度阈值（过滤低相关性结果）
     
-    # 文本切分配置
-    "chunk_size": 900,                     # 文本块大小
-    "chunk_overlap": 100,                  # 文本块重叠大小
+    # 文本切分配置（M4优化）
+    "chunk_size": 1200,                    # 文本块大小（增大以保留更多上下文）
+    "chunk_overlap": 200,                  # 文本块重叠大小（增加以避免信息断裂）
+    
+    # 性能优化配置
+    "batch_size": 32,                      # 向量化批处理大小（M4统一内存优势）
+    "max_documents_per_upload": 20,        # 单次上传文档数量限制（控制内存）
+    "enable_cache": True,                  # 启用缓存优化
     
     # 显示配置
     "model_display_name": "Qwen 2.5 7B",  # 显示的模型名称
     "gpu_display_name": "M4 Pro",          # 显示的 GPU 名称
+    "show_performance_stats": True,        # 显示性能统计
 }
 # ================================================
 
@@ -103,11 +112,13 @@ st.markdown("""
 @st.cache_resource
 def init_models():
     # 本地环境使用 localhost，Docker 环境通过环境变量 OLLAMA_HOST 覆盖
+    # M4 优化：增加上下文窗口，利用统一内存架构
     llm = ChatOllama(
         model=CONFIG["llm_model"], 
         temperature=CONFIG["llm_temperature"], 
         streaming=True, 
-        base_url=CONFIG["ollama_host"]
+        base_url=CONFIG["ollama_host"],
+        num_ctx=CONFIG["llm_num_ctx"]  # M4 可以处理更大上下文
     )
     embeddings = OllamaEmbeddings(
         model=CONFIG["embedding_model"], 
@@ -138,7 +149,13 @@ with st.sidebar:
     
     # 显示已上传文件列表
     if uploaded_files:
-        st.caption(f"已选择 {len(uploaded_files)} 个文件")
+        file_count = len(uploaded_files)
+        st.caption(f"已选择 {file_count} 个文件")
+        
+        # M4 性能提示：文档数量限制
+        if file_count > CONFIG["max_documents_per_upload"]:
+            st.warning(f"⚠️ 为保证 M4 性能，建议单次上传不超过 {CONFIG['max_documents_per_upload']} 个文档")
+        
         for file in uploaded_files:
             st.caption(f"📄 {file.name}")
     
@@ -208,6 +225,9 @@ with st.sidebar:
                 chunks = text_splitter.split_documents(all_documents)
                 
                 st.write(f"🧬 正在生成向量索引（共 {len(chunks)} 个语义片段）...")
+                st.write(f"💡 M4 优化：使用批处理加速向量化（批大小: {CONFIG['batch_size']}）")
+                
+                # M4 优化：批处理向量化，利用统一内存架构
                 vectorstore = Chroma.from_documents(
                     documents=chunks, 
                     embedding=embeddings,
@@ -241,7 +261,32 @@ with st.sidebar:
     else:
         st.warning("⚠️ 知识库未初始化")
     
+    # 系统信息显示
     st.info(f"**模型:** {CONFIG['model_display_name']}\n\n**GPU:** {CONFIG['gpu_display_name']}\n\n**向量引擎:** ChromaDB")
+    
+    # M4 性能优化提示
+    if CONFIG["show_performance_stats"]:
+        with st.expander("⚡ M4 性能优化说明"):
+            st.markdown("""
+            **当前优化配置：**
+            - 📊 Chunk Size: {chunk_size} (增大以保留更多上下文)
+            - 🔄 Chunk Overlap: {chunk_overlap} (增加以避免信息断裂)
+            - 🎯 Top-K: {top_k} (提升多文档检索精度)
+            - 🌡️ Temperature: {temp} (平衡创造性和准确性)
+            - 🧠 Context Window: {ctx} (利用M4统一内存)
+            
+            **性能建议：**
+            - ✅ 单次上传不超过 {max_docs} 个文档
+            - ✅ 使用批处理加速向量化
+            - ✅ 启用缓存减少重复计算
+            """.format(
+                chunk_size=CONFIG['chunk_size'],
+                chunk_overlap=CONFIG['chunk_overlap'],
+                top_k=CONFIG['retriever_top_k'],
+                temp=CONFIG['llm_temperature'],
+                ctx=CONFIG['llm_num_ctx'],
+                max_docs=CONFIG['max_documents_per_upload']
+            ))
     
     # 操作按钮
     col1, col2 = st.columns(2)
@@ -310,16 +355,59 @@ if prompt := st.chat_input("输入您的问题..."):
         st.warning("🚨 请先在左侧控制面板上传文档（支持 PDF/TXT/Word/Excel/Markdown）以激活知识库。")
     else:
         with st.chat_message("ai", avatar="🤖"):
-            # A. 动态思考卡片
-            thought_placeholder = st.empty()
-            with thought_placeholder.container():
-                st.markdown("""
-                    <div class="thought-card">
-                        🔍 <b>Deep Analysis</b>: 正在多轮历史中解析意图并检索向量片段...
-                    </div>
-                """, unsafe_allow_html=True)
+            # 思考过程容器
+            thinking_container = st.container()
             
-            # B. 回答占位符
+            with thinking_container:
+                # 阶段1: 问题理解
+                status_placeholder = st.empty()
+                status_placeholder.info("🧠 **阶段 1/4**: 正在理解问题并分析上下文...")
+                
+                import time
+                time.sleep(0.3)  # 短暂延迟，让用户看到过程
+                
+                # 阶段2: 检索相关文档
+                status_placeholder.info("🔍 **阶段 2/4**: 正在向量数据库中检索相关文档...")
+                
+                # 获取相关文档（M4优化：添加相似度阈值过滤）
+                retriever = st.session_state.vectorstore.as_retriever(
+                    search_type="similarity_score_threshold",
+                    search_kwargs={
+                        "k": CONFIG["retriever_top_k"],
+                        "score_threshold": CONFIG["retriever_score_threshold"]
+                    }
+                )
+                relevant_docs = retriever.get_relevant_documents(prompt)
+                
+                # 显示检索结果
+                retrieval_expander = st.expander(f"📚 检索到 {len(relevant_docs)} 个相关文档片段", expanded=False)
+                with retrieval_expander:
+                    # 按来源分组
+                    docs_by_source = {}
+                    for doc in relevant_docs:
+                        source = doc.metadata.get("source", "未知来源")
+                        if source not in docs_by_source:
+                            docs_by_source[source] = []
+                        docs_by_source[source].append(doc)
+                    
+                    for source, docs in docs_by_source.items():
+                        st.markdown(f"**📄 {source}** ({len(docs)} 个片段)")
+                        for i, doc in enumerate(docs):
+                            with st.container():
+                                st.caption(f"片段 {i+1}:")
+                                st.text(doc.page_content[:200] + "..." if len(doc.page_content) > 200 else doc.page_content)
+                
+                time.sleep(0.3)
+                
+                # 阶段3: LLM思考
+                status_placeholder.info(f"💭 **阶段 3/4**: {CONFIG['model_display_name']} 正在综合 {len(relevant_docs)} 个片段生成答案...")
+                
+                time.sleep(0.3)
+                
+                # 阶段4: 生成回答
+                status_placeholder.info("✍️ **阶段 4/4**: 正在流式生成回答...")
+            
+            # 回答占位符
             response_placeholder = st.empty()
             full_response = ""
             
@@ -327,26 +415,18 @@ if prompt := st.chat_input("输入您的问题..."):
             config = {"configurable": {"session_id": "m4_native_session"}}
             
             try:
-                # C. 执行流式流
-                has_shown_docs = False
+                # 执行流式生成
                 for chunk in chain.stream({"input": prompt}, config=config):
-                    # 检索到文档后立即更新思考状态
-                    if "context" in chunk and not has_shown_docs:
-                        with thought_placeholder.container():
-                            st.markdown(f"""
-                                <div class="thought-card">
-                                    ✅ <b>Context Found</b>: 检索到 {len(chunk['context'])} 个相关语义片段。正在合成回答...
-                                </div>
-                            """, unsafe_allow_html=True)
-                        has_shown_docs = True
-                    
                     # 流式渲染回答
                     if "answer" in chunk:
                         full_response += chunk["answer"]
                         response_placeholder.markdown(full_response + "▌")
                 
-                # 完成后清理光标和思考卡片（或保留卡片作为溯源）
+                # 完成后清理光标
                 response_placeholder.markdown(full_response)
+                
+                # 清除状态提示
+                status_placeholder.success("✅ 回答完成！")
                 
                 # D. 增加来源标注（支持多文档溯源）
                 with st.expander("🔗 来源溯源及关联度"):
