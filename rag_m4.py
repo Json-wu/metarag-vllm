@@ -1,4 +1,8 @@
+import os
+import time
+
 import streamlit as st
+from langchain_core.embeddings import Embeddings
 from langchain_ollama import OllamaEmbeddings, ChatOllama
 from langchain_community.vectorstores import Chroma
 from langchain_community.document_loaders import (
@@ -9,12 +13,77 @@ from langchain_community.document_loaders import (
     UnstructuredMarkdownLoader
 )
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain.chains import create_history_aware_retriever, create_retrieval_chain
-from langchain.chains.combine_documents import create_stuff_documents_chain
+from langchain_classic.chains import create_history_aware_retriever, create_retrieval_chain
+from langchain_classic.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_community.chat_message_histories import StreamlitChatMessageHistory
 from langchain_core.runnables.history import RunnableWithMessageHistory
-import os
+from langchain_classic.retrievers import BM25Retriever, EnsembleRetriever, ContextualCompressionRetriever
+from langchain_classic.retrievers.document_compressors import CrossEncoderReranker
+from langchain_community.cross_encoders import HuggingFaceCrossEncoder
+
+
+def normalize_ollama_host(host: str | None) -> str:
+    """Normalize Ollama client URL. 0.0.0.0 is bind-only and returns 502 from clients."""
+    default = "http://127.0.0.1:11434"
+    if not host:
+        return default
+    host = host.strip()
+    if not host.startswith(("http://", "https://")):
+        host = f"http://{host}"
+    return host.replace("0.0.0.0", "127.0.0.1")
+
+
+class BatchedEmbeddings(Embeddings):
+    """Batch embedding requests with retry to avoid Ollama 502 errors."""
+
+    def __init__(self, inner: Embeddings, batch_size: int = 32, max_retries: int = 3):
+        self._inner = inner
+        self.batch_size = batch_size
+        self.max_retries = max_retries
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        results: list[list[float]] = []
+        for i in range(0, len(texts), self.batch_size):
+            batch = texts[i : i + self.batch_size]
+            for attempt in range(self.max_retries):
+                try:
+                    results.extend(self._inner.embed_documents(batch))
+                    break
+                except Exception as e:
+                    is_502 = getattr(e, "status_code", None) == 502 or "502" in str(e)
+                    if is_502 and attempt < self.max_retries - 1:
+                        time.sleep(2 ** attempt)
+                        continue
+                    raise
+        return results
+
+    def embed_query(self, text: str) -> list[float]:
+        return self._inner.embed_query(text)
+
+
+def build_vectorstore_batched(chunks, embedding, persist_directory, batch_size):
+    """Build Chroma index in batches with progress feedback."""
+    vectorstore = None
+    total = len(chunks)
+    progress = st.progress(0, text="正在向量化...")
+    for i in range(0, total, batch_size):
+        batch = chunks[i : i + batch_size]
+        if vectorstore is None:
+            vectorstore = Chroma.from_documents(
+                documents=batch,
+                embedding=embedding,
+                persist_directory=persist_directory,
+            )
+        else:
+            vectorstore.add_documents(batch)
+        progress.progress(
+            min((i + len(batch)) / total, 1.0),
+            text=f"向量化 {min(i + len(batch), total)}/{total}",
+        )
+    progress.empty()
+    return vectorstore
+
 
 # ==================== 配置中心 ====================
 # 针对 Mac mini M4 优化的配置参数
@@ -29,7 +98,7 @@ CONFIG = {
     "embedding_model": "nomic-embed-text", # Embedding 模型名称
     "llm_temperature": 0.1,                # 温度参数（略微提高创造性，同时保持准确）
     "llm_num_ctx": 4096,                   # 上下文窗口大小（M4可以处理更大上下文）
-    "ollama_host": os.getenv("OLLAMA_HOST", "http://localhost:11434"),  # Ollama 服务地址
+    "ollama_host": normalize_ollama_host(os.getenv("OLLAMA_HOST")),  # Ollama 服务地址
     
     # 向量数据库配置（M4优化）
     "chroma_persist_dir": "./chroma_db",   # ChromaDB 持久化目录
@@ -44,6 +113,13 @@ CONFIG = {
     "batch_size": 32,                      # 向量化批处理大小（M4统一内存优势）
     "max_documents_per_upload": 20,        # 单次上传文档数量限制（控制内存）
     "enable_cache": True,                  # 启用缓存优化
+    
+    # 高级检索配置
+    "enable_hybrid_search": True,          # 启用混合检索（BM25 + 向量）
+    "hybrid_search_weights": [0.3, 0.7],   # 混合检索权重 [BM25权重, 向量权重]
+    "enable_reranking": True,              # 启用重排序
+    "reranker_model": "BAAI/bge-reranker-base",  # 重排序模型（base适合M4）
+    "reranker_top_n": 5,                   # 重排序后保留的文档数量
     
     # 显示配置
     "model_display_name": "Qwen 2.5 7B",  # 显示的模型名称
@@ -120,10 +196,12 @@ def init_models():
         base_url=CONFIG["ollama_host"],
         num_ctx=CONFIG["llm_num_ctx"]  # M4 可以处理更大上下文
     )
-    embeddings = OllamaEmbeddings(
-        model=CONFIG["embedding_model"], 
-        base_url=CONFIG["ollama_host"]
+    base_embeddings = OllamaEmbeddings(
+        model=CONFIG["embedding_model"],
+        base_url=CONFIG["ollama_host"],
+        keep_alive=600,
     )
+    embeddings = BatchedEmbeddings(base_embeddings, batch_size=CONFIG["batch_size"])
     return llm, embeddings
 
 llm, embeddings = init_models()
@@ -226,25 +304,37 @@ with st.sidebar:
                 
                 st.write(f"🧬 正在生成向量索引（共 {len(chunks)} 个语义片段）...")
                 st.write(f"💡 M4 优化：使用批处理加速向量化（批大小: {CONFIG['batch_size']}）")
-                
-                # M4 优化：批处理向量化，利用统一内存架构
-                vectorstore = Chroma.from_documents(
-                    documents=chunks, 
-                    embedding=embeddings,
-                    persist_directory=CONFIG["chroma_persist_dir"]
-                )
-                st.session_state.vectorstore = vectorstore
-                
-                # 保存已加载的文件列表
-                if "loaded_files" not in st.session_state:
-                    st.session_state.loaded_files = []
-                st.session_state.loaded_files = [f.name for f in uploaded_files if f.name not in failed_files]
-                
-                status.update(label="✅ 知识库构建完成", state="complete", expanded=False)
-                st.success(f"🎉 成功加载 {success_count}/{len(uploaded_files)} 个文档，共 {len(chunks)} 个语义片段")
-                
-                if failed_files:
-                    st.warning(f"⚠️ 以下文件加载失败: {', '.join(failed_files)}")
+
+                try:
+                    vectorstore = build_vectorstore_batched(
+                        chunks,
+                        embeddings,
+                        CONFIG["chroma_persist_dir"],
+                        CONFIG["batch_size"],
+                    )
+                except Exception as e:
+                    status.update(label="❌ 向量索引构建失败", state="error", expanded=True)
+                    if "502" in str(e) or getattr(e, "status_code", None) == 502:
+                        st.error(
+                            "Ollama 嵌入服务返回 502。请确认 Ollama 正在运行且已拉取模型：\n"
+                            f"`ollama pull {CONFIG['embedding_model']}`\n"
+                            "然后重试。若仍失败，可尝试重启 Ollama：`ollama serve`"
+                        )
+                    else:
+                        st.error(f"向量索引构建失败: {e}")
+                else:
+                    st.session_state.vectorstore = vectorstore
+                    st.session_state.all_chunks = chunks
+
+                    if "loaded_files" not in st.session_state:
+                        st.session_state.loaded_files = []
+                    st.session_state.loaded_files = [f.name for f in uploaded_files if f.name not in failed_files]
+
+                    status.update(label="✅ 知识库构建完成", state="complete", expanded=False)
+                    st.success(f"🎉 成功加载 {success_count}/{len(uploaded_files)} 个文档，共 {len(chunks)} 个语义片段")
+
+                    if failed_files:
+                        st.warning(f"⚠️ 以下文件加载失败: {', '.join(failed_files)}")
             else:
                 status.update(label="❌ 没有成功加载的文档", state="error", expanded=False)
                 st.error("所有文档加载失败，请检查文件格式")
@@ -367,17 +457,55 @@ if prompt := st.chat_input("输入您的问题..."):
                 time.sleep(0.3)  # 短暂延迟，让用户看到过程
                 
                 # 阶段2: 检索相关文档
-                status_placeholder.info("🔍 **阶段 2/4**: 正在向量数据库中检索相关文档...")
+                if CONFIG["enable_hybrid_search"] and "all_chunks" in st.session_state:
+                    status_placeholder.info("🔍 **阶段 2/4**: 正在使用混合检索（BM25 + 向量）...")
+                    
+                    # 创建BM25检索器
+                    bm25_retriever = BM25Retriever.from_documents(st.session_state.all_chunks)
+                    bm25_retriever.k = CONFIG["retriever_top_k"]
+                    
+                    # 创建向量检索器
+                    vector_retriever = st.session_state.vectorstore.as_retriever(
+                        search_kwargs={"k": CONFIG["retriever_top_k"]}
+                    )
+                    
+                    # 混合检索器
+                    ensemble_retriever = EnsembleRetriever(
+                        retrievers=[bm25_retriever, vector_retriever],
+                        weights=CONFIG["hybrid_search_weights"]
+                    )
+                    
+                    # 如果启用Reranker，添加重排序
+                    if CONFIG["enable_reranking"]:
+                        status_placeholder.info("🎯 **阶段 2/4**: 混合检索完成，正在使用Reranker重排序...")
+                        
+                        # 创建Reranker
+                        reranker_model = HuggingFaceCrossEncoder(model_name=CONFIG["reranker_model"])
+                        compressor = CrossEncoderReranker(
+                            model=reranker_model, 
+                            top_n=CONFIG["reranker_top_n"]
+                        )
+                        
+                        # 创建压缩检索器
+                        retriever = ContextualCompressionRetriever(
+                            base_compressor=compressor,
+                            base_retriever=ensemble_retriever
+                        )
+                    else:
+                        retriever = ensemble_retriever
+                else:
+                    status_placeholder.info("🔍 **阶段 2/4**: 正在向量数据库中检索相关文档...")
+                    
+                    # 使用标准向量检索
+                    retriever = st.session_state.vectorstore.as_retriever(
+                        search_type="similarity_score_threshold",
+                        search_kwargs={
+                            "k": CONFIG["retriever_top_k"],
+                            "score_threshold": CONFIG["retriever_score_threshold"]
+                        }
+                    )
                 
-                # 获取相关文档（M4优化：添加相似度阈值过滤）
-                retriever = st.session_state.vectorstore.as_retriever(
-                    search_type="similarity_score_threshold",
-                    search_kwargs={
-                        "k": CONFIG["retriever_top_k"],
-                        "score_threshold": CONFIG["retriever_score_threshold"]
-                    }
-                )
-                relevant_docs = retriever.get_relevant_documents(prompt)
+                relevant_docs = retriever.invoke(prompt)
                 
                 # 显示检索结果
                 retrieval_expander = st.expander(f"📚 检索到 {len(relevant_docs)} 个相关文档片段", expanded=False)
@@ -430,7 +558,7 @@ if prompt := st.chat_input("输入您的问题..."):
                 
                 # D. 增加来源标注（支持多文档溯源）
                 with st.expander("🔗 来源溯源及关联度"):
-                    docs = st.session_state.vectorstore.as_retriever().get_relevant_documents(prompt)
+                    docs = st.session_state.vectorstore.as_retriever().invoke(prompt)
                     
                     # 按来源文档分组
                     docs_by_source = {}

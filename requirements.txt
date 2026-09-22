@@ -1,7 +1,9 @@
 streamlit
 langchain
+langchain-classic
 langchain-ollama
 langchain-community
+langchain-openai
 chromadb
 pypdf
 docx2txt
@@ -9,3 +11,6 @@ unstructured
 openpyxl
 python-docx
 markdown
+sentence-transformers
+rank-bm25
+torch

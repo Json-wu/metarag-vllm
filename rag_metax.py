@@ -16,11 +16,14 @@ from langchain_community.document_loaders import (
 )
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain.chains import create_history_aware_retriever, create_retrieval_chain
-from langchain.chains.combine_documents import create_stuff_documents_chain
+from langchain_classic.chains import create_history_aware_retriever, create_retrieval_chain
+from langchain_classic.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_community.chat_message_histories import StreamlitChatMessageHistory
 from langchain_core.runnables.history import RunnableWithMessageHistory
+from langchain_classic.retrievers import BM25Retriever, EnsembleRetriever, ContextualCompressionRetriever
+from langchain_classic.retrievers.document_compressors import CrossEncoderReranker
+from langchain_community.cross_encoders import HuggingFaceCrossEncoder
 
 # ============================================================
 # 🔧 全局配置区（针对 MetaX C500 8卡64GB 优化）
@@ -54,11 +57,15 @@ CONFIG = {
 
     # 性能优化配置（C500 专属）
     "max_documents_per_upload": 100,               # 单次上传文档数量（8卡可处理更多）
-    "enable_reranking": False,                     # 是否启用重排序（可选，需额外模型）
-    "reranker_model": "BAAI/bge-reranker-large",  # 重排序模型
-    "reranker_top_n": 10,                          # 重排序后保留数量
     "enable_cache": True,                          # 启用缓存
     "show_performance_stats": True,                # 显示性能统计
+    
+    # 高级检索配置
+    "enable_hybrid_search": True,                  # 启用混合检索（BM25 + 向量）
+    "hybrid_search_weights": [0.3, 0.7],           # 混合检索权重 [BM25权重, 向量权重]
+    "enable_reranking": True,                      # 启用重排序（C500性能强劲）
+    "reranker_model": "BAAI/bge-reranker-large",  # 重排序模型（large适合C500）
+    "reranker_top_n": 10,                          # 重排序后保留数量
     
     # 显示配置
     "page_title": "🚀 国产GPU超大规模RAG",
@@ -358,6 +365,9 @@ with st.sidebar:
                     persist_directory=CONFIG["chroma_persist_dir"],
                 )
                 st.session_state.vectorstore = vectorstore
+                
+                # 保存chunks用于混合检索（BM25需要）
+                st.session_state.all_chunks = chunks
 
                 status.update(
                     label=f"✅ 知识库就绪！共索引 {len(chunks)} 个片段",
@@ -453,17 +463,55 @@ if prompt := st.chat_input("输入您的问题..."):
                 time.sleep(0.3)  # 短暂延迟，让用户看到过程
                 
                 # 阶段2: 检索相关文档
-                status_placeholder.info("🔍 **阶段 2/4**: 正在向量数据库中检索相关文档...")
+                if CONFIG["enable_hybrid_search"] and "all_chunks" in st.session_state:
+                    status_placeholder.info("🔍 **阶段 2/4**: 正在使用混合检索（BM25 + 向量）...")
+                    
+                    # 创建BM25检索器
+                    bm25_retriever = BM25Retriever.from_documents(st.session_state.all_chunks)
+                    bm25_retriever.k = CONFIG["retriever_top_k"]
+                    
+                    # 创建向量检索器
+                    vector_retriever = st.session_state.vectorstore.as_retriever(
+                        search_kwargs={"k": CONFIG["retriever_top_k"]}
+                    )
+                    
+                    # 混合检索器
+                    ensemble_retriever = EnsembleRetriever(
+                        retrievers=[bm25_retriever, vector_retriever],
+                        weights=CONFIG["hybrid_search_weights"]
+                    )
+                    
+                    # 如果启用Reranker，添加重排序
+                    if CONFIG["enable_reranking"]:
+                        status_placeholder.info("🎯 **阶段 2/4**: 混合检索完成，正在使用Reranker重排序...")
+                        
+                        # 创建Reranker
+                        reranker_model = HuggingFaceCrossEncoder(model_name=CONFIG["reranker_model"])
+                        compressor = CrossEncoderReranker(
+                            model=reranker_model, 
+                            top_n=CONFIG["reranker_top_n"]
+                        )
+                        
+                        # 创建压缩检索器
+                        retriever = ContextualCompressionRetriever(
+                            base_compressor=compressor,
+                            base_retriever=ensemble_retriever
+                        )
+                    else:
+                        retriever = ensemble_retriever
+                else:
+                    status_placeholder.info("🔍 **阶段 2/4**: 正在向量数据库中检索相关文档...")
+                    
+                    # 使用标准向量检索
+                    retriever = st.session_state.vectorstore.as_retriever(
+                        search_type="similarity_score_threshold",
+                        search_kwargs={
+                            "k": CONFIG["retriever_top_k"],
+                            "score_threshold": CONFIG["retriever_score_threshold"]
+                        }
+                    )
                 
-                # 获取相关文档（C500优化：使用相似度阈值过滤）
-                retriever = st.session_state.vectorstore.as_retriever(
-                    search_type="similarity_score_threshold",
-                    search_kwargs={
-                        "k": CONFIG["retriever_top_k"],
-                        "score_threshold": CONFIG["retriever_score_threshold"]
-                    }
-                )
-                relevant_docs = retriever.get_relevant_documents(prompt)
+                relevant_docs = retriever.invoke(prompt)
                 
                 # 显示检索结果
                 retrieval_expander = st.expander(f"📚 检索到 {len(relevant_docs)} 个相关文档片段", expanded=False)
